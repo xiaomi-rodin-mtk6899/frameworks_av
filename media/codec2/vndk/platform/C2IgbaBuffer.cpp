@@ -15,6 +15,7 @@
  */
 //#define LOG_NDEBUG 0
 #define LOG_TAG "C2IgbaBuffer"
+#include <atomic>
 #include <android-base/logging.h>
 #include <vndk/hardware_buffer.h>
 #include <utils/Log.h>
@@ -76,30 +77,72 @@ c2_status_t static CreateGraphicBlockFromAhwb(AHardwareBuffer *ahwb,
 
 } // anonymous namespace
 
+static std::atomic<uint64_t> sIgbaDbgCreated{0};
+static std::atomic<uint64_t> sIgbaDbgDestroyed{0};
+static std::atomic<uint64_t> sIgbaDbgRegistered{0};
+static std::atomic<uint64_t> sIgbaDbgDisowned{0};
+
+static uint64_t igbaDbgGetBufferId(const AHardwareBuffer* buffer) {
+    uint64_t id = 0;
+    if (!buffer) return 0;
+    if (__builtin_available(android __ANDROID_API_T__, *)) {
+        if (AHardwareBuffer_getId(buffer, &id) != ::android::OK) return 0;
+    }
+    return id;
+}
+
+static int64_t igbaDbgAlive() {
+    return static_cast<int64_t>(sIgbaDbgCreated.load(std::memory_order_relaxed))
+            - static_cast<int64_t>(sIgbaDbgDestroyed.load(std::memory_order_relaxed));
+}
+
 C2IgbaBlockPoolData::C2IgbaBlockPoolData(
         const AHardwareBuffer *buffer,
-        std::shared_ptr<C2IgbaInterface> &igba) : mOwned(true), mBuffer(buffer), mIgba(igba) {
+        std::shared_ptr<C2IgbaInterface> &igba)
+    : mOwned(true), mBuffer(buffer), mIgba(igba) {
     CHECK(mBuffer);
     AHardwareBuffer_acquire(const_cast<AHardwareBuffer *>(mBuffer));
+    const uint64_t id = igbaDbgGetBufferId(mBuffer);
+    const uint64_t created = sIgbaDbgCreated.fetch_add(1, std::memory_order_relaxed) + 1;
+    ALOGE("IGBADBG CREATE data=%p ahwb=%p id=%llu owned=1 igba=%p created=%llu destroyed=%llu alive=%lld",
+          static_cast<void *>(this), static_cast<void *>(const_cast<AHardwareBuffer *>(mBuffer)),
+          static_cast<unsigned long long>(id), static_cast<void *>(igba.get()),
+          static_cast<unsigned long long>(created),
+          static_cast<unsigned long long>(sIgbaDbgDestroyed.load(std::memory_order_relaxed)),
+          static_cast<long long>(igbaDbgAlive()));
 }
 
 C2IgbaBlockPoolData::~C2IgbaBlockPoolData() {
     CHECK(mBuffer);
+    const uint64_t id = igbaDbgGetBufferId(mBuffer);
+    const bool wasOwned = mOwned;
+    bool hadIgba = false;
+    bool deallocateCalled = false;
+    bool aidlRet = true;
+    c2_status_t deallocateStatus = C2_OK;
     if (mOwned) {
         if (__builtin_available(android __ANDROID_API_T__, *)) {
             auto igba = mIgba.lock();
             if (igba) {
+                hadIgba = true;
+                deallocateCalled = true;
                 uint64_t origId;
                 CHECK(AHardwareBuffer_getId(mBuffer, &origId) == ::android::OK);
-                bool aidlRet = true;
-                c2_status_t status = igba->deallocate(origId, &aidlRet);
-                if (status != C2_OK || !aidlRet) {
-                    ALOGW("AHwb destruction notifying failure %d(%d)", status, aidlRet);
+                deallocateStatus = igba->deallocate(origId, &aidlRet);
+                if (deallocateStatus != C2_OK || !aidlRet) {
+                    ALOGW("AHwb destruction notifying failure %d(%d)", deallocateStatus, aidlRet);
                 }
             }
         }
     }
     AHardwareBuffer_release(const_cast<AHardwareBuffer *>(mBuffer));
+    const uint64_t destroyed = sIgbaDbgDestroyed.fetch_add(1, std::memory_order_relaxed) + 1;
+    ALOGE("IGBADBG DESTROY data=%p ahwb=%p id=%llu owned=%d hadIgba=%d dealloc=%d status=%d aidlRet=%d created=%llu destroyed=%llu alive=%lld",
+          static_cast<void *>(this), static_cast<void *>(const_cast<AHardwareBuffer *>(mBuffer)),
+          static_cast<unsigned long long>(id), wasOwned ? 1 : 0, hadIgba ? 1 : 0,
+          deallocateCalled ? 1 : 0, static_cast<int>(deallocateStatus), aidlRet ? 1 : 0,
+          static_cast<unsigned long long>(sIgbaDbgCreated.load(std::memory_order_relaxed)),
+          static_cast<unsigned long long>(destroyed), static_cast<long long>(igbaDbgAlive()));
 }
 
 C2IgbaBlockPoolData::type_t C2IgbaBlockPoolData::getType() const {
@@ -111,11 +154,28 @@ void C2IgbaBlockPoolData::getAHardwareBuffer(AHardwareBuffer **pBuf) const {
 }
 
 void C2IgbaBlockPoolData::disown() {
+    const uint64_t id = igbaDbgGetBufferId(mBuffer);
+    const bool wasOwned = mOwned;
     mOwned = false;
+    const uint64_t disowned = sIgbaDbgDisowned.fetch_add(1, std::memory_order_relaxed) + 1;
+    ALOGE("IGBADBG DISOWN data=%p ahwb=%p id=%llu wasOwned=%d disowned=%llu registered=%llu alive=%lld",
+          static_cast<void *>(this), static_cast<void *>(const_cast<AHardwareBuffer *>(mBuffer)),
+          static_cast<unsigned long long>(id), wasOwned ? 1 : 0,
+          static_cast<unsigned long long>(disowned),
+          static_cast<unsigned long long>(sIgbaDbgRegistered.load(std::memory_order_relaxed)),
+          static_cast<long long>(igbaDbgAlive()));
 }
 
 void C2IgbaBlockPoolData::registerIgba(std::shared_ptr<C2IgbaInterface> &igba) {
+    const uint64_t id = igbaDbgGetBufferId(mBuffer);
     mIgba = igba;
+    const uint64_t registered = sIgbaDbgRegistered.fetch_add(1, std::memory_order_relaxed) + 1;
+    ALOGE("IGBADBG REGISTER data=%p ahwb=%p id=%llu owned=%d igba=%p registered=%llu disowned=%llu alive=%lld",
+          static_cast<void *>(this), static_cast<void *>(const_cast<AHardwareBuffer *>(mBuffer)),
+          static_cast<unsigned long long>(id), mOwned ? 1 : 0, static_cast<void *>(igba.get()),
+          static_cast<unsigned long long>(registered),
+          static_cast<unsigned long long>(sIgbaDbgDisowned.load(std::memory_order_relaxed)),
+          static_cast<long long>(igbaDbgAlive()));
 }
 
 std::shared_ptr<C2GraphicBlock> _C2BlockFactory::CreateGraphicBlock(AHardwareBuffer *ahwb) {

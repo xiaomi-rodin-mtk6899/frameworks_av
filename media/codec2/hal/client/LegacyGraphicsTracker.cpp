@@ -15,6 +15,7 @@
  */
 // #define LOG_NDEBUG 0
 #define LOG_TAG "LegacyGraphicsTracker"
+#include <atomic>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -32,6 +33,18 @@
 namespace aidl::android::hardware::media::c2::implementation {
 
 namespace {
+
+static std::atomic<uint64_t> sDvTrackRender{0};
+static std::atomic<uint64_t> sDvTrackNoPool{0};
+static std::atomic<uint64_t> sDvTrackIgbaPool{0};
+static std::atomic<uint64_t> sDvTrackMigration{0};
+static std::atomic<uint64_t> sDvTrackQueued{0};
+static std::atomic<uint64_t> sDvAttachRequests{0};
+static std::atomic<uint64_t> sDvAttachCommits{0};
+static std::atomic<uint64_t> sDvAttachReleased{0};
+static std::atomic<uint64_t> sDvAttachCallbacks{0};
+static std::atomic<uint64_t> sDvBufCreated{0};
+static std::atomic<uint64_t> sDvBufDestroyed{0};
 
 static constexpr int kMaxDequeueMin = 1;
 static constexpr int kMaxDequeueMax = ::android::BufferQueueDefs::NUM_BUFFER_SLOTS - 2;
@@ -78,12 +91,40 @@ sp<GraphicBuffer> createGraphicBuffer(const C2ConstGraphicBlock& block, uint32_t
     // a new native_handle_t with undup'ed fds.
     native_handle_t* grallocHandle = ::android::UnwrapNativeCodec2GrallocHandle(block.handle());
     if (grallocHandle == nullptr) {
+        ALOGE("DVFD UNWRAP_FAIL c2handle=%p", block.handle());
         return nullptr;
     }
+
+    ALOGE("DVFD UNWRAP c2handle=%p gralloc=%p fds=%d ints=%d fd0=%d fd1=%d fd2=%d %ux%u fmt=%u usage=0x%llx stride=%u gen=%u bqId=%llu bqSlot=%d",
+          block.handle(),
+          grallocHandle,
+          grallocHandle->numFds,
+          grallocHandle->numInts,
+          grallocHandle->numFds > 0 ? grallocHandle->data[0] : -1,
+          grallocHandle->numFds > 1 ? grallocHandle->data[1] : -1,
+          grallocHandle->numFds > 2 ? grallocHandle->data[2] : -1,
+          width,
+          height,
+          format,
+          (unsigned long long)usage,
+          stride,
+          generation,
+          (unsigned long long)bqId,
+          bqSlot);
+
     sp<GraphicBuffer> graphicBuffer =
             new GraphicBuffer(grallocHandle, GraphicBuffer::CLONE_HANDLE, width, height, format, 1,
                               (usage | toUsage), stride);
     graphicBuffer->setGenerationNumber(toGeneration);
+
+    ALOGE("DVFD POST_GB c2handle=%p gralloc=%p gb=%p fd0=%d fd1=%d fd2=%d",
+          block.handle(),
+          grallocHandle,
+          graphicBuffer.get(),
+          grallocHandle->numFds > 0 ? grallocHandle->data[0] : -1,
+          grallocHandle->numFds > 1 ? grallocHandle->data[1] : -1,
+          grallocHandle->numFds > 2 ? grallocHandle->data[2] : -1);
+
     native_handle_delete(grallocHandle);
     return graphicBuffer;
 }
@@ -182,6 +223,22 @@ LegacyGraphicsTracker::BufferItem::BufferItem(uint32_t generation, int slot,
         mBuf = pBuf;
         mFence = fence;
         mInit = true;
+
+        const uint64_t created =
+                sDvBufCreated.fetch_add(1, std::memory_order_relaxed) + 1;
+        const uint64_t destroyed =
+                sDvBufDestroyed.load(std::memory_order_relaxed);
+
+        ALOGE("DVBUF CREATE source=GraphicBuffer item=%p ahwb=%p id=%llu slot=%d gen=%u usage=0x%llx created=%llu destroyed=%llu alive=%lld",
+              static_cast<void*>(this),
+              static_cast<void*>(mBuf),
+              (unsigned long long)mId,
+              mSlot,
+              mGeneration,
+              (unsigned long long)mUsage,
+              (unsigned long long)created,
+              (unsigned long long)destroyed,
+              (long long)created - (long long)destroyed);
     }
 }
 
@@ -202,11 +259,56 @@ LegacyGraphicsTracker::BufferItem::BufferItem(uint32_t generation, AHardwareBuff
         }
     }
     AHardwareBuffer_acquire(mBuf);
+
+    const uint64_t created =
+            sDvBufCreated.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t destroyed =
+            sDvBufDestroyed.load(std::memory_order_relaxed);
+
+    ALOGE("DVBUF CREATE source=AHardwareBuffer item=%p ahwb=%p id=%llu slot=%d gen=%u usage=0x%llx created=%llu destroyed=%llu alive=%lld",
+          static_cast<void*>(this),
+          static_cast<void*>(mBuf),
+          (unsigned long long)mId,
+          mSlot,
+          mGeneration,
+          (unsigned long long)mUsage,
+          (unsigned long long)created,
+          (unsigned long long)destroyed,
+          (long long)created - (long long)destroyed);
 }
 
 LegacyGraphicsTracker::BufferItem::~BufferItem() {
+    const uint64_t created =
+            sDvBufCreated.load(std::memory_order_relaxed);
+
+    uint64_t destroyed =
+            sDvBufDestroyed.load(std::memory_order_relaxed);
+
     if (mInit) {
         AHardwareBuffer_release(mBuf);
+
+        destroyed =
+                sDvBufDestroyed.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        ALOGE("DVBUF DESTROY item=%p ahwb=%p id=%llu slot=%d gen=%u usage=0x%llx created=%llu destroyed=%llu alive=%lld",
+              static_cast<void*>(this),
+              static_cast<void*>(mBuf),
+              (unsigned long long)mId,
+              mSlot,
+              mGeneration,
+              (unsigned long long)mUsage,
+              (unsigned long long)created,
+              (unsigned long long)destroyed,
+              (long long)created - (long long)destroyed);
+    } else {
+        ALOGE("DVBUF DESTROY item=%p init=0 id=%llu slot=%d gen=%u created=%llu destroyed=%llu alive=%lld",
+              static_cast<void*>(this),
+              (unsigned long long)mId,
+              mSlot,
+              mGeneration,
+              (unsigned long long)created,
+              (unsigned long long)destroyed,
+              (long long)created - (long long)destroyed);
     }
 }
 
@@ -1034,37 +1136,110 @@ c2_status_t LegacyGraphicsTracker::requestAttachForRender(const C2ConstGraphicBl
                                                           std::shared_ptr<BufferCache>* pCache,
                                                           std::shared_ptr<BufferItem>* pBuffer,
                                                           bool* updateDequeue) {
+    const uint64_t attachSeq =
+            sDvAttachRequests.fetch_add(1, std::memory_order_relaxed) + 1;
+
     if (mStopped.load() == true) {
+        ALOGE("DVATTACH REQUEST #%llu stopped=1",
+              (unsigned long long)attachSeq);
         ALOGE("cannot requestAttachForRender due to being stopped");
         return C2_BAD_STATE;
     }
+
     // allocate for attach
     c2_status_t res = C2_OK;
     std::shared_ptr<BufferCache> cache;
+    size_t cacheBefore = 0;
+    size_t dequeuedBefore = 0;
+    size_t deallocatingBefore = 0;
+    int dequeueableBefore = 0;
+
     {
         std::unique_lock<std::mutex> l(mLock);
         if (mStopRequested) {
+            ALOGE("DVATTACH REQUEST #%llu stopRequested=1",
+                  (unsigned long long)attachSeq);
             return C2_BAD_STATE;
         }
         if (!mBufferCache || !(mBufferCache->mIgbp)) {
+            ALOGE("DVATTACH REQUEST #%llu no current IGBP",
+                  (unsigned long long)attachSeq);
             return C2_OMITTED;
         }
+
+        cacheBefore = mBufferCache->mBuffers.size();
+        dequeuedBefore = mDequeued.size();
+        deallocatingBefore = mDeallocating.size();
+        dequeueableBefore = mDequeueable;
+
         res = requestAllocateLocked(&cache);
         if (res != C2_OK) {
+            ALOGE("DVATTACH REQUEST #%llu reserve failed res=%d cache=%zu dequeued=%zu deallocating=%zu dequeueable=%d",
+                  (unsigned long long)attachSeq, res, cacheBefore, dequeuedBefore,
+                  deallocatingBefore, dequeueableBefore);
             ALOGV("cannot allocate for requestAttachForRender: %d", res);
             return res;
         }
     }
+
     // attach to the surface
     ::android::sp<IGraphicBufferProducer> igbp = cache->mIgbp;
     uint32_t generation = cache->mGeneration;
     uint64_t usage = 0ULL;
     int slotId = -1;
     (void)igbp->getConsumerUsage(&usage);
+
     sp<GraphicBuffer> grBuf = createGraphicBuffer(blk, generation, usage);
     std::shared_ptr<BufferItem> buffer;
+
+    uint64_t ahbId = 0;
+    uint32_t ahbWidth = 0;
+    uint32_t ahbHeight = 0;
+    uint32_t ahbLayers = 0;
+    uint32_t ahbFormat = 0;
+    uint32_t ahbStride = 0;
+    uint64_t ahbUsage = 0;
+
     if (grBuf) {
+        if (__builtin_available(android __ANDROID_API_T__, *)) {
+            AHardwareBuffer* ahb = AHardwareBuffer_from_GraphicBuffer(grBuf.get());
+            if (ahb) {
+                (void)AHardwareBuffer_getId(ahb, &ahbId);
+                AHardwareBuffer_Desc desc{};
+                AHardwareBuffer_describe(ahb, &desc);
+                ahbWidth = desc.width;
+                ahbHeight = desc.height;
+                ahbLayers = desc.layers;
+                ahbFormat = desc.format;
+                ahbStride = desc.stride;
+                ahbUsage = desc.usage;
+            }
+        }
+
+        ALOGE("DVATTACH REQUEST #%llu PRE_ATTACH handle=%p gb=%p ahbId=%llu %ux%u layers=%u fmt=%u stride=%u usage=0x%llx cacheBefore=%zu dequeuedBefore=%zu deallocatingBefore=%zu dequeueableBefore=%d",
+              (unsigned long long)attachSeq,
+              blk.handle(),
+              grBuf.get(),
+              (unsigned long long)ahbId,
+              ahbWidth,
+              ahbHeight,
+              ahbLayers,
+              ahbFormat,
+              ahbStride,
+              (unsigned long long)ahbUsage,
+              cacheBefore,
+              dequeuedBefore,
+              deallocatingBefore,
+              dequeueableBefore);
+
         ::android::status_t status = igbp->attachBuffer(&slotId, grBuf);
+
+        ALOGE("DVATTACH REQUEST #%llu ATTACH status=%d slot=%d ahbId=%llu",
+              (unsigned long long)attachSeq,
+              (int)status,
+              slotId,
+              (unsigned long long)ahbId);
+
         if (status != ::android::OK) {
             res = C2_REFUSED;
         } else {
@@ -1081,20 +1256,64 @@ c2_status_t LegacyGraphicsTracker::requestAttachForRender(const C2ConstGraphicBl
             }
         }
     } else {
+        ALOGE("DVATTACH REQUEST #%llu createGraphicBuffer failed handle=%p",
+              (unsigned long long)attachSeq, blk.handle());
         res = C2_BAD_VALUE;
     }
+
     // Do commitAllocate() regardless of the return value, since commitAllocate()
-    // also handle rollback from requestAllocateLocked()(removing the pre allocated
-    // room).
+    // also handles rollback from requestAllocateLocked().
     commitAllocate(res, cache, false, slotId, fence, &buffer, updateDequeue);
+
+    size_t cacheAfterCommit = 0;
+    size_t dequeuedAfterCommit = 0;
+    size_t deallocatingAfterCommit = 0;
+    int dequeueableAfterCommit = 0;
+
+    {
+        std::unique_lock<std::mutex> l(mLock);
+        cacheAfterCommit = cache ? cache->mBuffers.size() : 0;
+        dequeuedAfterCommit = mDequeued.size();
+        deallocatingAfterCommit = mDeallocating.size();
+        dequeueableAfterCommit = mDequeueable;
+    }
+
+    const uint64_t commitSeq =
+            sDvAttachCommits.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    ALOGE("DVATTACH COMMIT_ALLOC #%llu request=%llu res=%d slot=%d bufferId=%llu cache=%zu->%zu dequeued=%zu->%zu deallocating=%zu->%zu dequeueable=%d->%d",
+          (unsigned long long)commitSeq,
+          (unsigned long long)attachSeq,
+          res,
+          slotId,
+          (unsigned long long)(buffer ? buffer->mId : 0),
+          cacheBefore,
+          cacheAfterCommit,
+          dequeuedBefore,
+          dequeuedAfterCommit,
+          deallocatingBefore,
+          deallocatingAfterCommit,
+          dequeueableBefore,
+          dequeueableAfterCommit);
+
     if (res == C2_OK) {
         // since attach/allocate was successful, prepare for render here.
         {
             std::unique_lock<std::mutex> l(mLock);
             mDeallocating.emplace(buffer->mId);
+
+            ALOGE("DVATTACH MARK_RENDER request=%llu slot=%d id=%llu cache=%zu dequeued=%zu deallocating=%zu dequeueable=%d",
+                  (unsigned long long)attachSeq,
+                  buffer->mSlot,
+                  (unsigned long long)buffer->mId,
+                  cache->mBuffers.size(),
+                  mDequeued.size(),
+                  mDeallocating.size(),
+                  mDequeueable);
         }
         cache->blockSlot(buffer->mSlot);
     }
+
     return res;
 }
 
@@ -1145,6 +1364,11 @@ void LegacyGraphicsTracker::commitRender(const std::shared_ptr<BufferCache>& cac
     std::unique_lock<std::mutex> l(mLock);
     uint64_t origBid = oldBuffer ? oldBuffer->mId : buffer->mId;
 
+    const size_t cacheBefore = cache ? cache->mBuffers.size() : 0;
+    const size_t dequeuedBefore = mDequeued.size();
+    const size_t deallocatingBefore = mDeallocating.size();
+    const int dequeueableBefore = mDequeueable;
+
     if (cache) {
         cache->unblockSlot(buffer->mSlot);
         if (oldBuffer) {
@@ -1155,38 +1379,94 @@ void LegacyGraphicsTracker::commitRender(const std::shared_ptr<BufferCache>& cac
             }
         }
     }
-    mDeallocating.erase(origBid);
-    mDequeued.erase(origBid);
 
-    if (cache.get() != mBufferCache.get() || bufferReplaced) {
+    const size_t delDeallocating = mDeallocating.erase(origBid);
+    const size_t delDequeued = mDequeued.erase(origBid);
+
+    const bool staleCache = cache.get() != mBufferCache.get();
+
+    ALOGE("DVATTACH COMMIT_RENDER slot=%d id=%llu oldId=%llu oldBuffer=%d replaced=%d staleCache=%d cache=%zu->%zu dequeued=%zu->%zu deallocating=%zu->%zu erasedDequeued=%zu erasedDeallocating=%zu dequeueable=%d",
+          buffer ? buffer->mSlot : -1,
+          (unsigned long long)(buffer ? buffer->mId : 0),
+          (unsigned long long)origBid,
+          oldBuffer ? 1 : 0,
+          bufferReplaced ? 1 : 0,
+          staleCache ? 1 : 0,
+          cacheBefore,
+          cache ? cache->mBuffers.size() : 0,
+          dequeuedBefore,
+          mDequeued.size(),
+          deallocatingBefore,
+          mDeallocating.size(),
+          delDequeued,
+          delDeallocating,
+          mDequeueable);
+
+    if (staleCache || bufferReplaced) {
         // Surface changed, no need to wait for buffer being released.
         if (adjustDequeueConfLocked(updateDequeue)) {
             return;
         }
         mDequeueable++;
         writeIncDequeueableLocked(1);
+
+        ALOGE("DVATTACH COMMIT_RENDER RELEASE_IMMEDIATE slot=%d id=%llu dequeueable=%d->%d",
+              buffer ? buffer->mSlot : -1,
+              (unsigned long long)(buffer ? buffer->mId : 0),
+              dequeueableBefore,
+              mDequeueable);
         return;
     }
+
+    ALOGE("DVATTACH COMMIT_RENDER WAIT_RELEASE slot=%d id=%llu cache=%zu dequeueable=%d attached=%d",
+          buffer ? buffer->mSlot : -1,
+          (unsigned long long)(buffer ? buffer->mId : 0),
+          cache ? cache->mBuffers.size() : 0,
+          mDequeueable,
+          cache ? cache->mNumAttached.load(std::memory_order_relaxed) : -1);
 }
 
 c2_status_t LegacyGraphicsTracker::render(const C2ConstGraphicBlock& blk,
                                           const IGraphicBufferProducer::QueueBufferInput& input,
                                           IGraphicBufferProducer::QueueBufferOutput* output) {
+    const uint64_t renderSeq =
+            sDvTrackRender.fetch_add(1, std::memory_order_relaxed) + 1;
+
     std::shared_ptr<BufferCache> cache;
     std::shared_ptr<BufferItem> buffer;
-    uint64_t bid;
+    uint64_t bid = 0;
     bool updateDequeue = false;
     bool fromCache = false;
     std::shared_ptr<_C2BlockPoolData> poolData = _C2BlockFactory::GetGraphicBlockPoolData(blk);
+
     if (!poolData) {
+        const uint64_t noPool =
+                sDvTrackNoPool.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        ALOGE("DVTRACK RENDER #%llu NO_POOL_DATA noPool=%llu igbaPool=%llu handle=%p",
+              (unsigned long long)renderSeq,
+              (unsigned long long)noPool,
+              (unsigned long long)sDvTrackIgbaPool.load(std::memory_order_relaxed),
+              blk.handle());
+
         if (!blk.handle()) {
+            ALOGE("DVTRACK RENDER #%llu NO_POOL_DATA has no native_handle",
+                  (unsigned long long)renderSeq);
             ALOGE("block does not have native_handle for render");
             return C2_CORRUPTED;
         }
+
         // This might be a block directly created by gralloc allocator.
         // So we need to attach the block to the surface before render.
         fromCache = true;
         c2_status_t res = requestAttachForRender(blk, input.fence, &cache, &buffer, &updateDequeue);
+
+        ALOGE("DVTRACK RENDER #%llu ATTACH_EXTERNAL res=%d buffer=%p slot=%d",
+              (unsigned long long)renderSeq,
+              res,
+              buffer.get(),
+              buffer ? buffer->mSlot : -1);
+
         if (res != C2_OK) {
             if (updateDequeue) {
                 updateDequeueConf();
@@ -1195,13 +1475,36 @@ c2_status_t LegacyGraphicsTracker::render(const C2ConstGraphicBlock& blk,
             return res;
         }
     } else {
+        const uint64_t igbaPool =
+                sDvTrackIgbaPool.fetch_add(1, std::memory_order_relaxed) + 1;
+
         c2_status_t res = retrieveAHardwareBufferId(blk, &bid);
+
+        ALOGE("DVTRACK RENDER #%llu IGBA_POOL_DATA poolData=%p bid=%llu res=%d noPool=%llu igbaPool=%llu",
+              (unsigned long long)renderSeq,
+              poolData.get(),
+              (unsigned long long)bid,
+              res,
+              (unsigned long long)sDvTrackNoPool.load(std::memory_order_relaxed),
+              (unsigned long long)igbaPool);
+
         if (res != C2_OK) {
             ALOGE("retrieving AHB-ID for GraphicBlock failed");
             return C2_CORRUPTED;
         }
+
         _C2BlockFactory::DisownIgbaBlock(poolData);
+
         res = requestRender(bid, &cache, &buffer, &fromCache, &updateDequeue);
+
+        ALOGE("DVTRACK RENDER #%llu REQUEST_RENDER bid=%llu res=%d fromCache=%d buffer=%p slot=%d",
+              (unsigned long long)renderSeq,
+              (unsigned long long)bid,
+              res,
+              fromCache ? 1 : 0,
+              buffer.get(),
+              buffer ? buffer->mSlot : -1);
+
         if (res != C2_OK) {
             if (updateDequeue) {
                 updateDequeueConf();
@@ -1209,10 +1512,22 @@ c2_status_t LegacyGraphicsTracker::render(const C2ConstGraphicBlock& blk,
             return res;
         }
     }
+
     int cacheSlotId = fromCache ? buffer->mSlot : -1;
     std::shared_ptr<BufferItem> oldBuffer;
+
+    ALOGE("DVTRACK RENDER #%llu PREPARED fromCache=%d slot=%d bid=%llu",
+          (unsigned long long)renderSeq,
+          fromCache ? 1 : 0,
+          cacheSlotId,
+          (unsigned long long)bid);
+
     ALOGV("render prepared: igbp(%d) slot(%d)", bool(cache->mIgbp), cacheSlotId);
+
     if (!fromCache) {
+        const uint64_t migration =
+                sDvTrackMigration.fetch_add(1, std::memory_order_relaxed) + 1;
+
         // The buffer does not come from the current cache.
         // The buffer is needed to be migrated(attached).
         uint64_t newUsage = 0ULL;
@@ -1220,6 +1535,15 @@ c2_status_t LegacyGraphicsTracker::render(const C2ConstGraphicBlock& blk,
         (void)cache->mIgbp->getConsumerUsage(&newUsage);
         std::shared_ptr<BufferItem> newBuffer = buffer->migrateBuffer(newUsage, cache->mGeneration);
         sp<GraphicBuffer> gb = newBuffer ? newBuffer->getGraphicBuffer() : nullptr;
+
+        ALOGE("DVTRACK RENDER #%llu MIGRATE #%llu bid=%llu old=%p new=%p gb=%p usage=0x%llx",
+              (unsigned long long)renderSeq,
+              (unsigned long long)migration,
+              (unsigned long long)bid,
+              buffer.get(),
+              newBuffer.get(),
+              gb.get(),
+              (unsigned long long)newUsage);
 
         if (!gb) {
             ALOGE("render: realloc-ing a new buffer for migration failed");
@@ -1230,7 +1554,17 @@ c2_status_t LegacyGraphicsTracker::render(const C2ConstGraphicBlock& blk,
             }
             return C2_REFUSED;
         }
-        if (cache->mIgbp->attachBuffer(&(newBuffer->mSlot), gb) != ::android::OK) {
+
+        const ::android::status_t attachRes =
+                cache->mIgbp->attachBuffer(&(newBuffer->mSlot), gb);
+
+        ALOGE("DVTRACK RENDER #%llu MIGRATE_ATTACH bid=%llu res=%d slot=%d",
+              (unsigned long long)renderSeq,
+              (unsigned long long)bid,
+              (int)attachRes,
+              newBuffer->mSlot);
+
+        if (attachRes != ::android::OK) {
             ALOGE("render: attaching a new buffer to IGBP failed");
             std::shared_ptr<BufferCache> nullCache;
             commitDeallocate(nullCache, -1, bid, &updateDequeue);
@@ -1239,13 +1573,29 @@ c2_status_t LegacyGraphicsTracker::render(const C2ConstGraphicBlock& blk,
             }
             return C2_REFUSED;
         }
+
         cache->waitOnSlot(newBuffer->mSlot);
         cache->blockSlot(newBuffer->mSlot);
         oldBuffer = buffer;
         buffer = newBuffer;
     }
+
     ::android::status_t renderRes = cache->mIgbp->queueBuffer(buffer->mSlot, input, output);
+
+    const uint64_t queued =
+            sDvTrackQueued.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    ALOGE("DVTRACK RENDER #%llu QUEUE #%llu bid=%llu slot=%d migration=%d res=%d replaced=%d",
+          (unsigned long long)renderSeq,
+          (unsigned long long)queued,
+          (unsigned long long)bid,
+          buffer->mSlot,
+          !fromCache ? 1 : 0,
+          (int)renderRes,
+          output ? (output->bufferReplaced ? 1 : 0) : -1);
+
     ALOGV("render done: migration(%d), render(err = %d)", !fromCache, renderRes);
+
     if (renderRes != ::android::OK) {
         CHECK(renderRes != ::android::BAD_VALUE);
         ALOGE("render: failed to queueBuffer() err = %d", renderRes);
@@ -1258,6 +1608,15 @@ c2_status_t LegacyGraphicsTracker::render(const C2ConstGraphicBlock& blk,
     }
 
     commitRender(cache, buffer, oldBuffer, output->bufferReplaced, &updateDequeue);
+
+    ALOGE("DVTRACK RENDER #%llu COMMIT bid=%llu noPool=%llu igbaPool=%llu migrations=%llu queued=%llu",
+          (unsigned long long)renderSeq,
+          (unsigned long long)bid,
+          (unsigned long long)sDvTrackNoPool.load(std::memory_order_relaxed),
+          (unsigned long long)sDvTrackIgbaPool.load(std::memory_order_relaxed),
+          (unsigned long long)sDvTrackMigration.load(std::memory_order_relaxed),
+          (unsigned long long)sDvTrackQueued.load(std::memory_order_relaxed));
+
     if (updateDequeue) {
         updateDequeueConf();
     }
@@ -1278,31 +1637,96 @@ void LegacyGraphicsTracker::pollForRenderedFrames(FrameEventHistoryDelta* delta)
 }
 
 void LegacyGraphicsTracker::onReleased(uint32_t generation) {
+    const uint64_t releaseSeq =
+            sDvAttachReleased.fetch_add(1, std::memory_order_relaxed) + 1;
+
     bool updateDequeue = false;
     {
         std::unique_lock<std::mutex> l(mLock);
-        if (mBufferCache->mGeneration == generation) {
+
+        const uint32_t currentGeneration = mBufferCache ? mBufferCache->mGeneration : 0;
+        const int attachedBefore = mBufferCache ? mBufferCache->mNumAttached.load(std::memory_order_relaxed) : -1;
+        const size_t cacheSize = mBufferCache ? mBufferCache->mBuffers.size() : 0;
+        const int dequeueableBefore = mDequeueable;
+
+        if (mBufferCache && mBufferCache->mGeneration == generation) {
             if (mBufferCache->mNumAttached > 0) {
-                ALOGV("one onReleased() ignored for each prior onAttached().");
                 mBufferCache->mNumAttached--;
+
+                ALOGE("DVATTACH ON_RELEASED #%llu gen=%u currentGen=%u IGNORED_FOR_ATTACHED attached=%d->%d cache=%zu dequeueable=%d",
+                      (unsigned long long)releaseSeq,
+                      generation,
+                      currentGeneration,
+                      attachedBefore,
+                      mBufferCache->mNumAttached.load(std::memory_order_relaxed),
+                      cacheSize,
+                      mDequeueable);
+
+                ALOGV("one onReleased() ignored for each prior onAttached().");
                 return;
             }
+
             if (!adjustDequeueConfLocked(&updateDequeue)) {
                 mDequeueable++;
                 writeIncDequeueableLocked(1);
             }
+
+            ALOGE("DVATTACH ON_RELEASED #%llu gen=%u currentGen=%u RELEASE_TOKEN attached=%d cache=%zu dequeueable=%d->%d update=%d",
+                  (unsigned long long)releaseSeq,
+                  generation,
+                  currentGeneration,
+                  attachedBefore,
+                  cacheSize,
+                  dequeueableBefore,
+                  mDequeueable,
+                  updateDequeue ? 1 : 0);
+        } else {
+            ALOGE("DVATTACH ON_RELEASED #%llu gen=%u currentGen=%u STALE cache=%zu attached=%d dequeueable=%d",
+                  (unsigned long long)releaseSeq,
+                  generation,
+                  currentGeneration,
+                  cacheSize,
+                  attachedBefore,
+                  mDequeueable);
         }
     }
+
     if (updateDequeue) {
         updateDequeueConf();
     }
 }
 
 void LegacyGraphicsTracker::onAttached(uint32_t generation) {
+    const uint64_t attachCbSeq =
+            sDvAttachCallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+
     std::unique_lock<std::mutex> l(mLock);
-    if (mBufferCache->mGeneration == generation) {
-        ALOGV("buffer attached");
+
+    const uint32_t currentGeneration = mBufferCache ? mBufferCache->mGeneration : 0;
+    const int attachedBefore = mBufferCache ? mBufferCache->mNumAttached.load(std::memory_order_relaxed) : -1;
+    const size_t cacheSize = mBufferCache ? mBufferCache->mBuffers.size() : 0;
+
+    if (mBufferCache && mBufferCache->mGeneration == generation) {
         mBufferCache->mNumAttached++;
+
+        ALOGE("DVATTACH ON_ATTACHED #%llu gen=%u currentGen=%u attached=%d->%d cache=%zu dequeueable=%d",
+              (unsigned long long)attachCbSeq,
+              generation,
+              currentGeneration,
+              attachedBefore,
+              mBufferCache->mNumAttached.load(std::memory_order_relaxed),
+              cacheSize,
+              mDequeueable);
+
+        ALOGV("buffer attached");
+    } else {
+        ALOGE("DVATTACH ON_ATTACHED #%llu gen=%u currentGen=%u STALE cache=%zu attached=%d dequeueable=%d",
+              (unsigned long long)attachCbSeq,
+              generation,
+              currentGeneration,
+              cacheSize,
+              attachedBefore,
+              mDequeueable);
     }
 }
 
